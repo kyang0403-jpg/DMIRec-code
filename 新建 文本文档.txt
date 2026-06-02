@@ -187,7 +187,7 @@ class ResidualQuantization(nn.Module):
         return quantized_total.view(B, L, D)
 
 
-class Dulitem_sasres(nn.Module):
+class DMIRec(nn.Module):
 
     def __init__(self, user_num, item_num, device, args):
         super().__init__()
@@ -333,8 +333,7 @@ class Dulitem_sasres(nn.Module):
     def forward(self,
                 seq,
                 pos,
-                neg,
-                **kwargs):
+                neg):
 
         all_log_feats, all_orth_loss, all_shared_loss, all_reco_loss = self.log2feats(seq)
         log_feats = all_log_feats
@@ -358,8 +357,7 @@ class Dulitem_sasres(nn.Module):
 
     def predict(self,
                 seq,
-                item_indices,
-                **kwargs):  # for inference
+                item_indices,):  # for inference
         '''Used to predict the score of item_indices given log_seqs'''
 
         log_feats, all_orth_loss, all_shared_loss, all_reco_loss = self.log2feats(seq)  # user_ids hasn't been used yet
