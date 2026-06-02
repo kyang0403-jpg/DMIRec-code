@@ -1,0 +1,370 @@
+import os
+import pickle
+import numpy as np
+import torch
+import torch.nn as nn
+import math
+import torch.nn.functional as F
+
+
+class Three_Shared_Specific_Feature(nn.Module):
+    def __init__(self, hidden_size):
+        super().__init__()
+        self.txt = nn.Sequential(
+            nn.Linear(hidden_size, hidden_size * 2),
+            nn.LeakyReLU(),
+            nn.Linear(hidden_size * 2, hidden_size * 2),
+        )
+        self.photo = nn.Sequential(
+            nn.Linear(hidden_size, hidden_size * 2),
+            nn.LeakyReLU(),
+            nn.Linear(hidden_size * 2, hidden_size * 2),
+        )
+        self.review = nn.Sequential(
+            nn.Linear(hidden_size, hidden_size * 2),
+            nn.LeakyReLU(),
+            nn.Linear(hidden_size * 2, hidden_size * 2),
+        )
+        self.w1 = nn.Sequential(
+            nn.Linear(hidden_size * 2, hidden_size),
+            nn.LeakyReLU(),
+            nn.Linear(hidden_size, hidden_size),
+        )
+        self.w2 = nn.Sequential(
+            nn.Linear(hidden_size * 2, hidden_size),
+            nn.LeakyReLU(),
+            nn.Linear(hidden_size, hidden_size),
+        )
+        self.w3 = nn.Sequential(
+            nn.Linear(hidden_size * 2, hidden_size),
+            nn.LeakyReLU(),
+            nn.Linear(hidden_size, hidden_size),
+        )
+
+
+    def orth_loss(self, z1, z2):
+
+        z1 = F.normalize(z1, dim=-1)
+        z2 = F.normalize(z2, dim=-1)
+        return (z1 * z2).sum(dim=-1).pow(2).mean()
+
+    def forward(self, e_t, e_v, e_r):
+
+        text_speci, shared1 = torch.chunk( self.txt(e_t), 2, dim=-1)
+        photo_speci, shared2 = torch.chunk( self.photo(e_v), 2, dim=-1)
+        review_speci, shared3 = torch.chunk( self.review(e_r), 2, dim=-1)
+
+        all_orth_loss = self.orth_loss(text_speci, shared1) + self.orth_loss(photo_speci, shared2) + self.orth_loss(review_speci, shared3)
+        all_shared_loss = F.mse_loss(shared1, shared2) + F.mse_loss(shared1, shared3) + F.mse_loss(shared2, shared3)
+        rec_e_t = self.w1(torch.cat([text_speci, shared1], dim=-1))
+        rec_e_v = self.w2(torch.cat([photo_speci, shared2], dim=-1))
+        rec_e_r = self.w3(torch.cat([review_speci, shared3], dim=-1))
+        all_reco_loss = F.mse_loss(rec_e_t, e_t) + F.mse_loss(rec_e_v, e_v) + F.mse_loss(rec_e_r, e_r)
+
+        all_shared = shared1 + shared2 + shared3
+
+        return text_speci, photo_speci, review_speci, all_shared, all_orth_loss, all_shared_loss, all_reco_loss
+
+
+class MultiHeadSelfAttention(nn.Module):
+
+
+    def __init__(self, hidden_size: int, num_heads: int, dropout: float = 0.1, bias: bool = True):
+        super().__init__()
+        assert hidden_size % num_heads == 0, "hidden_size 必须能被 num_heads 整除"
+        self.hidden_size = hidden_size
+        self.num_heads = num_heads
+        self.head_dim = hidden_size // num_heads
+
+        self.qkv = nn.Linear(hidden_size, hidden_size * 3, bias=bias)
+        self.proj = nn.Linear(hidden_size, hidden_size, bias=bias)
+
+        self.attn_drop = nn.Dropout(dropout)
+        self.proj_drop = nn.Dropout(dropout)
+        self.alpha = 0.7
+
+
+    def forward(self, x, intent=None):
+
+        B, L, D = x.shape
+        x_seq = x.view(B, L, self.num_heads, self.head_dim).permute(0, 2, 1, 3)
+
+        if intent is not None:
+           intent_seq = intent.view(B, L, self.num_heads, self.head_dim).permute(0, 2, 1, 3)
+
+        # qkv: (B, L, 3D) -> (B, 3, H, L, Hd)
+        qkv = self.qkv(x).view(B, L, 3, self.num_heads, self.head_dim).permute(0, 2, 3, 1, 4)
+        q, k, v = qkv[:, 0], qkv[:, 1], qkv[:, 2]  # (B, H, L, Hd)
+
+        # attention scores: (B, H, L, L)
+        scale = self.head_dim ** -0.5
+        seq_score = torch.matmul(q, k.transpose(-1, -2))
+
+        if intent is not None:
+            atten_score = torch.matmul(x_seq, intent_seq.transpose(-1, -2)) / self.alpha
+            attn = (seq_score + atten_score) * scale
+        else:
+            attn = seq_score * scale
+
+        attn = F.softmax(attn, dim=-1)
+        attn = self.attn_drop(attn)
+
+        # weighted sum: (B, H, L, Hd) -> (B, L, D)
+        out = torch.matmul(attn, v).transpose(1, 2).contiguous().view(B, L, D)
+        out = self.proj(out)
+        out = self.proj_drop(out)
+        return out
+
+
+class IntentRouter(nn.Module):
+
+    def __init__(self, d_model, K=3):
+        super().__init__()
+        self.K = K
+        self.conver = nn.Sequential(
+            nn.Linear(d_model, d_model * K),
+            nn.LeakyReLU(),
+            nn.Linear(d_model * K, d_model * K),
+        )
+        self.conv2d = nn.Conv2d(
+            in_channels=d_model,
+            out_channels=d_model,
+            kernel_size=(3, 3),
+            stride=(3 // 2, 3 // 2),
+            padding=(1, 1),
+            bias=False,
+        )
+
+    def forward(self, seq):
+        # similarity
+        B, L, D = seq.shape
+        k_seq = self.conver(seq).view(B, L, -1, D)  # [B, L, K, D]
+        out = self.conv2d(k_seq.reshape(B, D, L, self.K)).reshape(B, L, self.K, D).contiguous()  # [B, L, K, D]
+        output = out.sum(dim=-2)
+
+        return output
+
+
+class ResidualQuantization(nn.Module):
+
+    def __init__(self, dim, codebook_size=100, num_codebooks=3):
+        super().__init__()
+
+        self.codebooks = nn.ParameterList([
+            nn.Parameter(torch.randn(codebook_size, dim))
+            for _ in range(num_codebooks)
+        ])
+
+    def forward(self, z):
+        """
+        x : B,K,D
+        """
+        B, L, D = z.shape
+        # flatten
+        z_flat = z.reshape(-1, D)  # [B*L, D]
+        residual = z_flat
+        quantized_total = torch.zeros_like(z_flat)
+
+        for layer in range(len(self.codebooks)):
+            codebook = self.codebooks[layer]  # [K, D]
+
+            # cosine normalization
+            residual_norm = F.normalize(residual, dim=-1)
+            codebook_norm = F.normalize(codebook, dim=-1)
+
+            # cosine similarity
+            sim = torch.matmul(residual_norm, codebook_norm.t())  # [B*L, K]
+
+            # argmax
+            indices = torch.argmax(sim, dim=-1)  # [B*L]
+            chosen = codebook[indices]  # [B*L, D]
+
+            quantized_total = quantized_total + (chosen - residual).detach() + residual
+            #quantized_total = quantized_total + chosen
+
+            residual = residual - chosen
+
+        return quantized_total.view(B, L, D)
+
+
+class Dulitem_sasres(nn.Module):
+
+    def __init__(self, user_num, item_num, device, args):
+        super().__init__()
+        self.max_len = args.max_len
+        self.dev = device
+        self.hidden_dim = args.hidden_size
+        self.mask_token = item_num + 1
+        self.num_heads = args.num_heads
+        self.alpha = args.alpha
+
+        llm_item_emb = pickle.load(
+            open(os.path.join(f"data/{args.dataset}", "pca768_mul_itm_emb_np.pkl"), "rb")).squeeze()
+        llm_item_emb = np.insert(llm_item_emb, 0, values=np.zeros((1, llm_item_emb.shape[1])), axis=0)
+        llm_item_emb = np.concatenate([llm_item_emb, np.zeros((1, llm_item_emb.shape[1]))], axis=0)
+        self.llm_item_emb = nn.Embedding.from_pretrained(torch.Tensor(llm_item_emb))
+        self.llm_item_emb.weight.requires_grad = False  # the grad is false in default
+
+        item_intent_emb = pickle.load(
+            open(os.path.join(f"data/{args.dataset}", "pca768_mul_intent_emb.pkl"), "rb")).squeeze()
+        item_intent_emb = np.insert(item_intent_emb, 0, values=np.zeros((1, item_intent_emb.shape[1])), axis=0)
+        item_intent_emb = np.concatenate([item_intent_emb, np.zeros((1, item_intent_emb.shape[1]))], axis=0)
+        self.item_intent_emb = nn.Embedding.from_pretrained(torch.Tensor(item_intent_emb))
+        self.item_intent_emb.weight.requires_grad = False
+
+        item_txt_emb = pickle.load(
+            open(os.path.join(f"data/{args.dataset}", "pca768_item_txt_emb.pkl"), "rb")).squeeze()
+        item_txt_emb = np.insert(item_txt_emb, 0, values=np.zeros((1, item_txt_emb.shape[1])), axis=0)
+        item_txt_emb = np.concatenate([item_txt_emb, np.zeros((1, item_txt_emb.shape[1]))], axis=0)
+        self.item_txt_emb = nn.Embedding.from_pretrained(torch.Tensor(item_txt_emb))
+        self.item_txt_emb.weight.requires_grad = False
+
+        item_photo_emb = pickle.load(
+            open(os.path.join(f"data/{args.dataset}", "pca768_item_photo_emb.pkl"), "rb")).squeeze()
+        item_photo_emb = np.insert(item_photo_emb, 0, values=np.zeros((1, item_photo_emb.shape[1])), axis=0)
+        item_photo_emb = np.concatenate([item_photo_emb, np.zeros((1, item_photo_emb.shape[1]))], axis=0)
+        self.item_photo_emb = nn.Embedding.from_pretrained(torch.Tensor(item_photo_emb))
+        self.item_photo_emb.weight.requires_grad = False
+
+        item_review_emb = pickle.load(
+            open(os.path.join(f"data/{args.dataset}", "pca768_item_review_emb.pkl"), "rb")).squeeze()
+        item_review_emb = np.insert(item_review_emb, 0, values=np.zeros((1, item_review_emb.shape[1])), axis=0)
+        item_review_emb = np.concatenate([item_review_emb, np.zeros((1, item_review_emb.shape[1]))], axis=0)
+        self.item_review_emb = nn.Embedding.from_pretrained(torch.Tensor(item_review_emb))
+        self.item_review_emb.weight.requires_grad = False
+
+        self.adaper1 = nn.Sequential(
+            nn.Linear(llm_item_emb.shape[1], llm_item_emb.shape[1] // 2),
+            nn.GELU(),
+            nn.Linear(llm_item_emb.shape[1] // 2, args.hidden_size)
+        )
+
+        self.adaper2 = nn.Linear(item_intent_emb.shape[1], args.hidden_size)
+        self.adaper3 = nn.Linear(item_txt_emb.shape[1], args.hidden_size)
+        self.adaper4 = nn.Linear(item_photo_emb.shape[1], args.hidden_size)
+        self.adaper5 = nn.Linear(item_review_emb.shape[1], args.hidden_size)
+
+        self.shared_specific_feature = Three_Shared_Specific_Feature(args.hidden_size)
+        self.intent_router = IntentRouter(args.hidden_size)
+        self.text_quantizer = ResidualQuantization(args.hidden_size)
+        self.photo_quantizer = ResidualQuantization(args.hidden_size)
+        self.review_quantizer = ResidualQuantization(args.hidden_size)
+        self.shared_quantizer = ResidualQuantization(args.hidden_size)
+
+        self.four_gate = nn.Linear(args.hidden_size * 3, 3)
+
+        self.attn_layers = MultiHeadSelfAttention(
+            args.hidden_size, self.num_heads, args.dropout_rate
+        )
+
+        self.two_gate = nn.Linear(args.hidden_size * 3, 3)
+        self.layernorm = nn.LayerNorm(args.hidden_size)
+        self.dropout = nn.Dropout(args.dropout_rate)
+
+        self.loss_func = nn.BCEWithLogitsLoss()
+        self.filter_init_modules = ["llm_item_emb", "item_intent_emb", "item_txt_emb", "item_photo_emb",
+                                    "item_review_emb"]
+        self._init_weights()
+
+    def _init_weights(self):
+
+        for name, param in self.named_parameters():
+            try:
+                flag = True  # denote initialize this param
+                for fm in self.filter_init_modules:
+                    if fm in name:  # if the param in filter_modules, do not initialize
+                        flag = False
+                if flag:
+                    nn.init.xavier_normal_(param.data)
+            except:
+                pass
+
+
+    def get_llm_seq(self, log_seqs):
+
+        llm_seq = self.llm_item_emb(log_seqs)
+        llm_seq1 = self.adaper1(llm_seq)
+
+        return llm_seq1
+
+    def log2feats(self, log_seqs):
+
+        # item embedding
+        item_emb = self.get_llm_seq(log_seqs)
+        item_emb = self.dropout(self.layernorm(item_emb))
+
+        # codebook intent
+        item_txt_emb = self.adaper3(self.item_txt_emb(log_seqs))
+        item_photo_emb = self.adaper4(self.item_photo_emb(log_seqs))
+        item_review_emb = self.adaper5(self.item_review_emb(log_seqs))
+
+        text_fea, photo_fea, review_fea, shared, all_orth_loss, all_shared_loss, all_reco_loss = self.shared_specific_feature(item_txt_emb, item_photo_emb, item_review_emb)
+
+        text_intent = self.text_quantizer(text_fea)
+        photo_intent = self.photo_quantizer(photo_fea)
+        review_intent = self.review_quantizer(review_fea)
+        shared_intent = self.shared_quantizer(shared)
+
+
+        gate = torch.softmax(self.four_gate(torch.cat([text_intent, photo_intent, review_intent, shared_intent], dim=-1)), dim=-1)
+        gate1, gate2, gate3, gate4 = gate[:, :, 0:1], gate[:, :, 1:2], gate[:, :, 2:3], gate[:, :, 3:4]
+        txt_photot_seq_emb = gate1 * text_intent + gate2 * photo_intent + gate3 * review_intent + gate4 * shared_intent
+
+
+
+        # MLLM intent
+        item_intent_emb = self.adaper2(self.item_intent_emb(log_seqs))
+        intent_context2 = self.intent_router(item_intent_emb)  # B,K,D
+
+        u1 = self.attn_layers(item_emb, txt_photot_seq_emb)
+        u2 = self.attn_layers(item_emb, intent_context2)
+
+        gate = self.two_gate(torch.cat([u1, u2, item_emb], dim=-1))
+        weights = torch.softmax(gate, dim=-1)
+        w1 = weights[:, :, 0:1]
+        w2 = weights[:, :, 1:2]
+        w3 = weights[:, :, 2:3]
+        fused = w1 * u1 + w2 * u2 + item_emb * w3
+
+
+        return fused, all_orth_loss, all_shared_loss, all_reco_loss
+
+
+    def forward(self,
+                seq,
+                pos,
+                neg,
+                **kwargs):
+
+        all_log_feats, all_orth_loss, all_shared_loss, all_reco_loss = self.log2feats(seq)
+        log_feats = all_log_feats
+        pos_embs = self.get_llm_seq(pos)
+        neg_embs = self.get_llm_seq(neg)
+
+        pos_logits = (log_feats * pos_embs).sum(dim=-1)
+        neg_logits = (log_feats * neg_embs).sum(dim=-1)
+
+        pos_labels, neg_labels = torch.ones(pos_logits.shape, device=self.dev), torch.zeros(neg_logits.shape,  device=self.dev)
+        indices = (pos != 0)  # do not calculate the padding units
+        pos_loss, neg_loss = self.loss_func(pos_logits[indices], pos_labels[indices]), self.loss_func(
+            neg_logits[indices], neg_labels[indices])
+
+        loss = pos_loss + neg_loss
+
+        total_loss = loss + 0.01 * all_orth_loss + 0.1 * all_shared_loss + 0.01 * all_reco_loss
+
+        return total_loss
+
+
+    def predict(self,
+                seq,
+                item_indices,
+                **kwargs):  # for inference
+        '''Used to predict the score of item_indices given log_seqs'''
+
+        log_feats, all_orth_loss, all_shared_loss, all_reco_loss = self.log2feats(seq)  # user_ids hasn't been used yet
+        final_feat = log_feats[:, -1, :]
+        item_embs = self.get_llm_seq(item_indices)  # (U, I, C)
+        logits = item_embs.matmul(final_feat.unsqueeze(-1)).squeeze(-1)
+
+        return logits  # preds # (U, I)
